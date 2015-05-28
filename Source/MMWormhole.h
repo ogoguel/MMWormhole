@@ -1,5 +1,5 @@
 //
-// MMWormhole.h
+// MMWormhole.m
 //
 // Copyright (c) 2014 Mutual Mobile (http://www.mutualmobile.com/)
 //
@@ -21,124 +21,268 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#import <Foundation/Foundation.h>
+// OG Added MultiObject support
 
-/**
- This class creates a wormhole between a containing iOS application and an extension. The wormhole
- is meant to be used to pass data or commands back and forth between the two locations. The effect
- closely resembles interprocess communication between the app and the extension, though this is not
- really the case. The wormhole does have some disadvantages, including the fact that a contract must
- be determined in advance between the app and the extension that defines the interchange format.
- 
- A good way to think of the wormhole is a collection of shared mailboxes. An identifier is
- essentially a unique mailbox you can send messages to. You know where a message will be delivered
- to because of the identifier you associate with it, but not necessarily when the message will be
- picked up by the recipient. If the app or extension are in the background, they may not receive the
- message immediately. By convention, sending messages should be done from one side to another, not
- necessarily from yourself to yourself. It's also a good practice to check the contents of your
- mailbox when your app or extension wakes up, in case any messages have been left there while you
- were away.
- 
- Passing a message to the wormhole can be inferred as a data transfer package or as a command. In
- both cases, the passed message is archived using NSKeyedArchiver to a .archive file named with the
- included identifier. Once passed, the contents of the written .archive file can be queried using
- the messageWithIdentifier: method. As a command, the simple existence of the message in the shared
- app group should be taken as proof of the command's invocation. The contents of the message then
- become parameters to be evaluated along with the command. Of course, to avoid confusion later, it
- may be best to clear the contents of the message after recognizing the command. The
- -clearMessageContentsForIdentifier: method is provided for this purpose.
- 
- A good wormhole includes wormhole aliens who listen for message changes. This class supports
- CFNotificationCenter Darwin Notifications, which act as a bridge between the containing app and the
- extension. When a message is passed with an identifier, a notification is fired to the Darwin
- Notification Center with the given identifier. If you have indicated your interest in the message
- by using the -listenForMessageWithIdentifier:completion: method then your completion block will be
- called when this notification is received, and the contents of the message will be unarchived and
- passed as an object to the completion block.
- 
- It's worth noting that as a best practice to avoid confusing issues or deadlock that messages
- should be passed one way only for a given identifier. The containing app should pass messages to
- one set of identifiers, which are only ever read or listened for by the extension, and vic versa.
- The extension should not then write messages back to the same identifier. Instead, the extension
- should use it's own set of identifiers to associate with it's messages back to the application.
- Passing messages to the same identifier from two locations should be done only at your own risk.
- */
-@interface MMWormhole : NSObject
+#import "MMWormhole.h"
 
-/**
- Designated Initializer. This method must be called with an application group identifier that will
- be used to contain passed messages. It is also recommended that you include a directory name for
- messages to be read and written, but this parameter is optional.
- 
- @param identifier An application group identifier
- @param directory An optional directory to read/write messages
- */
+#if !__has_feature(objc_arc)
+#error This class requires automatic reference counting
+#endif
+
+#include <CoreFoundation/CoreFoundation.h>
+
+static NSString * const MMWormholeNotificationName = @"MMWormholeNotificationName";
+
+@interface MMWormhole ()
+
+@property (nonatomic, copy) NSString *applicationGroupIdentifier;
+@property (nonatomic, copy) NSString *directory;
+@property (nonatomic, strong) NSFileManager *fileManager;
+@property (nonatomic, strong) NSMutableDictionary *listenerBlocks;
+
+@end
+
+@implementation MMWormhole
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wobjc-designated-initializers"
+
+- (id)init {
+    return nil;
+}
+
+#pragma clang diagnostic pop
 
 - (instancetype)initWithApplicationGroupIdentifier:(NSString *)identifier
-                                 optionalDirectory:(NSString *)directory NS_DESIGNATED_INITIALIZER;
+                                 optionalDirectory:(NSString *)directory {
+    if ((self = [super init])) {
+        
+        if (NO == [[NSFileManager defaultManager] respondsToSelector:@selector(containerURLForSecurityApplicationGroupIdentifier:)]) {
+            //Protect the user of a crash because of iOSVersion < iOS7
+            return nil;
+        }
+        
+        _applicationGroupIdentifier = [identifier copy];
+        _directory = [directory copy];
+        _fileManager = [[NSFileManager alloc] init];
+        _listenerBlocks = [NSMutableDictionary dictionary];
+        
 
-/**
- This method passes a message object associated with a given identifier. This is the primary means
- of passing information through the wormhole.
- 
- @warning You should avoid situations where you need to pass messages to the same identifier in
- rapid succession. If a message's contents will be changing rapidly then consider modifying your
- workflow to write bulk changes without listening on the other side of the wormhole, and then add a
- listener for a "finished changing" message to let the other side know it's safe to read the 
- contents of your message.
- 
- @param messageobject The message object to be passed. 
-                      This object may be nil. In this case only a notification is posted.
- @param identifier The identifier for the message
- */
-- (void)passMessageObject:(id <NSCoding>)messageObject
-               identifier:(NSString *)identifier;
+        // Check that the directory can be created at init
+        NSString* path = [self messagePassingDirectoryPath];
+        if (path==nil)
+            return nil;
 
-/**
- This method returns the value of a message with a specific identifier as an object.
- 
- @param identifier The identifier for the message
- */
-- (id)messageWithIdentifier:(NSString *)identifier;
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(didReceiveMessageNotification:)
+                                                     name:MMWormholeNotificationName
+                                                   object:nil];
+    }
 
-/**
- This method clears the contents of a specific message with a given identifier.
- 
- @param identifier The identifier for the message
- */
-- (void)clearMessageContentsForIdentifier:(NSString *)identifier;
+    return self;
+}
 
-/**
- This method clears the contents of your optional message directory to give you a clean state.
- 
- @warning This method will delete all messages passed to your message directory. Use with care.
- */
-- (void)clearAllMessageContents;
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    
+    CFNotificationCenterRef const center = CFNotificationCenterGetDarwinNotifyCenter();
+    CFNotificationCenterRemoveEveryObserver(center, (__bridge const void *)(self));
+}
 
-/**
- This method begins listening for notifications of changes to a message with a specific identifier.
- If notifications are observed then the given listener block will be called along with the actual
- message object.
- 
- @discussion This class only supports one listener per message identifier, so calling this method
- repeatedly for the same identifier will update the listener block that will be called when a
- message is heard.
- 
- @param identifier The identifier for the message
- @param listener A listener block called with the messageObject parameter when a notification
- is observed.
- */
+
+#pragma mark - Private File Operation Methods
+
+- (NSString *)messagePassingDirectoryPath {
+    NSURL *appGroupContainer = [self.fileManager containerURLForSecurityApplicationGroupIdentifier:self.applicationGroupIdentifier];
+    NSString *appGroupContainerPath = [appGroupContainer path];
+    NSString *directoryPath = appGroupContainerPath;
+    
+    if (self.directory != nil) {
+        directoryPath = [appGroupContainerPath stringByAppendingPathComponent:self.directory];
+    }
+    
+    [self.fileManager createDirectoryAtPath:directoryPath
+                withIntermediateDirectories:YES
+                                 attributes:nil
+                                      error:NULL];
+    
+    return directoryPath;
+}
+
+- (NSString *)filePathForIdentifier:(NSString *)identifier {
+    if (identifier == nil || identifier.length == 0) {
+        return nil;
+    }
+    
+    NSString *directoryPath = [self messagePassingDirectoryPath];
+    NSString *fileName = [NSString stringWithFormat:@"%@.archive", identifier];
+    NSString *filePath = [directoryPath stringByAppendingPathComponent:fileName];
+    
+    return filePath;
+}
+
+- (void)writeMessageObject:(id)messageObject toFileWithIdentifier:(NSString *)identifier {
+    if (identifier == nil) {
+        return;
+    }
+    
+    if (messageObject) {
+        NSData *data = [NSKeyedArchiver archivedDataWithRootObject:messageObject];
+        
+        static int messageNb = 1000000;
+        NSString* identifierhash = [NSString stringWithFormat:@"%@.%d",identifier,messageNb++];
+        NSString *filePath = [self filePathForIdentifier:identifierhash];
+        
+        if (data == nil || filePath == nil) {
+            return;
+        }
+        
+        BOOL success = [data writeToFile:filePath atomically:YES];
+        
+        if (!success) {
+            return;
+        }
+    }
+    
+    [self sendNotificationForMessageWithIdentifier:identifier];
+}
+
+- (id)messageObjectFromFileWithIdentifier:(NSString *)identifier {
+    if (identifier == nil) {
+        return nil;
+    }
+    
+    NSString* directoryPath = [self messagePassingDirectoryPath];
+    NSArray *messageFiles = [self.fileManager contentsOfDirectoryAtPath:directoryPath error:NULL];        
+    NSString* prefix = [NSString stringWithFormat:@"%@.",identifier];
+    for (NSString *path in messageFiles) 
+    {
+
+        if ([path hasPrefix:prefix])
+        {
+            NSString *filePath = [directoryPath stringByAppendingPathComponent:path];
+            NSData *data = [NSData dataWithContentsOfFile:filePath];
+            [self.fileManager removeItemAtPath:filePath error:NULL];
+            id messageObject = [NSKeyedUnarchiver unarchiveObjectWithData:data];
+            return messageObject;
+        }
+    }
+
+    return nil;
+}
+
+- (void)deleteFileForIdentifier:(NSString *)identifier {
+    [self.fileManager removeItemAtPath:[self filePathForIdentifier:identifier] error:NULL];
+}
+
+
+#pragma mark - Private Notification Methods
+
+- (void)sendNotificationForMessageWithIdentifier:(NSString *)identifier {
+    CFNotificationCenterRef const center = CFNotificationCenterGetDarwinNotifyCenter();
+    CFDictionaryRef const userInfo = NULL;
+    BOOL const deliverImmediately = YES;
+    CFStringRef str = (__bridge CFStringRef)identifier;
+    CFNotificationCenterPostNotification(center, str, NULL, userInfo, deliverImmediately);
+}
+
+- (void)registerForNotificationsWithIdentifier:(NSString *)identifier {
+    CFNotificationCenterRef const center = CFNotificationCenterGetDarwinNotifyCenter();
+    CFStringRef str = (__bridge CFStringRef)identifier;
+    CFNotificationCenterAddObserver(center,
+                                    (__bridge const void *)(self),
+                                    wormholeNotificationCallback,
+                                    str,
+                                    NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
+}
+
+- (void)unregisterForNotificationsWithIdentifier:(NSString *)identifier {
+    CFNotificationCenterRef const center = CFNotificationCenterGetDarwinNotifyCenter();
+    CFStringRef str = (__bridge CFStringRef)identifier;
+    CFNotificationCenterRemoveObserver(center,
+                                       (__bridge const void *)(self),
+                                       str,
+                                       NULL);
+}
+
+void wormholeNotificationCallback(CFNotificationCenterRef center,
+                               void * observer,
+                               CFStringRef name,
+                               void const * object,
+                               CFDictionaryRef userInfo) {
+    NSString *identifier = (__bridge NSString *)name;
+    [[NSNotificationCenter defaultCenter] postNotificationName:MMWormholeNotificationName
+                                                        object:nil
+                                                      userInfo:@{@"identifier" : identifier}];
+}
+
+- (void)didReceiveMessageNotification:(NSNotification *)notification {
+    typedef void (^MessageListenerBlock)(id messageObject);
+    
+    NSDictionary *userInfo = notification.userInfo;
+    NSString *identifier = [userInfo valueForKey:@"identifier"];
+    
+    if (identifier != nil) {
+        MessageListenerBlock listenerBlock = [self listenerBlockForIdentifier:identifier];
+
+        if (listenerBlock) {
+            id messageObject = [self messageObjectFromFileWithIdentifier:identifier];
+
+            listenerBlock(messageObject);
+        }
+    }
+}
+
+- (id)listenerBlockForIdentifier:(NSString *)identifier {
+    return [self.listenerBlocks valueForKey:identifier];
+}
+
+
+#pragma mark - Public Interface Methods
+
+- (void)passMessageObject:(id <NSCoding>)messageObject identifier:(NSString *)identifier {
+    [self writeMessageObject:messageObject toFileWithIdentifier:identifier];
+}
+
+
+- (id)messageWithIdentifier:(NSString *)identifier {
+    id messageObject = [self messageObjectFromFileWithIdentifier:identifier];
+    
+    return messageObject;
+}
+
+- (void)clearMessageContentsForIdentifier:(NSString *)identifier {
+    [self deleteFileForIdentifier:identifier];
+}
+
+- (void)clearAllMessageContents {
+    if (self.directory != nil) {
+        NSArray *messageFiles = [self.fileManager contentsOfDirectoryAtPath:[self messagePassingDirectoryPath] error:NULL];
+        
+        NSString *directoryPath = [self messagePassingDirectoryPath];
+        
+        for (NSString *path in messageFiles) {
+            NSString *filePath = [directoryPath stringByAppendingPathComponent:path];
+
+            [self.fileManager removeItemAtPath:filePath error:NULL];
+        }
+    }
+}
+
 - (void)listenForMessageWithIdentifier:(NSString *)identifier
-                              listener:(void (^)(id messageObject))listener;
+                              listener:(void (^)(id messageObject))listener {
+    if (identifier != nil) {
+        [self.listenerBlocks setValue:listener forKey:identifier];
+        [self registerForNotificationsWithIdentifier:identifier];
+    }
+}
 
-/**
- This method stops listening for change notifications for a given message identifier.
- 
- NOTE: This method is NOT required to be called. If the wormhole is deallocated then all listeners
- will go away as well.
- 
- @param identifier The identifier for the message
- */
-- (void)stopListeningForMessageWithIdentifier:(NSString *)identifier;
+- (void)stopListeningForMessageWithIdentifier:(NSString *)identifier {
+    if (identifier != nil) {
+        [self.listenerBlocks setValue:nil forKey:identifier];
+        [self unregisterForNotificationsWithIdentifier:identifier];
+    }
+}
 
 @end

@@ -65,6 +65,12 @@ static NSString * const MMWormholeNotificationName = @"MMWormholeNotificationNam
         _fileManager = [[NSFileManager alloc] init];
         _listenerBlocks = [NSMutableDictionary dictionary];
         
+
+        // Check that the directory can be created at init
+        NSString* path = [self messagePassingDirectoryPath];
+        if (path==nil)
+            return nil;
+
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(didReceiveMessageNotification:)
                                                      name:MMWormholeNotificationName
@@ -120,7 +126,10 @@ static NSString * const MMWormholeNotificationName = @"MMWormholeNotificationNam
     
     if (messageObject) {
         NSData *data = [NSKeyedArchiver archivedDataWithRootObject:messageObject];
-        NSString *filePath = [self filePathForIdentifier:identifier];
+        
+        static int messageNb = 1000000;
+        NSString* identifierhash = [NSString stringWithFormat:@"%@.%d",identifier,messageNb++];
+        NSString *filePath = [self filePathForIdentifier:identifierhash];
         
         if (data == nil || filePath == nil) {
             return;
@@ -141,15 +150,22 @@ static NSString * const MMWormholeNotificationName = @"MMWormholeNotificationNam
         return nil;
     }
     
-    NSData *data = [NSData dataWithContentsOfFile:[self filePathForIdentifier:identifier]];
-    
-    if (data == nil) {
-        return nil;
+    NSArray *messageFiles = [self.fileManager contentsOfDirectoryAtPath:directoryPath error:NULL];        
+    NSString* prefix = [NSString stringWithFormat:@"%@.",identifier];
+    for (NSString *path in messageFiles) 
+    {
+
+        if ([path hasPrefix:prefix])
+        {
+            NSString *filePath = [directoryPath stringByAppendingPathComponent:path];
+            NSData *data = [NSData dataWithContentsOfFile:filePath];
+            [self.fileManager removeItemAtPath:filePath error:NULL];
+            id messageObject = [NSKeyedUnarchiver unarchiveObjectWithData:data];
+            return messageObject;
+        }
     }
-    
-    id messageObject = [NSKeyedUnarchiver unarchiveObjectWithData:data];
-    
-    return messageObject;
+
+    return nil;
 }
 
 - (void)deleteFileForIdentifier:(NSString *)identifier {
